@@ -158,6 +158,26 @@ func StartCookieWatchdog() {
 				log.Printf("🚨 Health Monitor: Cookie expired detected (%s). Requesting on-demand refresh...", health.MinTTLFormatted)
 				BroadcastCookieRefresh()
 			}
+
+			// -- chrome-manage fast path (PRD Step 10 / Option A) ---------
+			// The extension broadcast above only helps if a browser happens to
+			// be open. This does not need one, and it also reacts to
+			// expiring_soon rather than only expired. Rate-limited per profile
+			// by shouldRequestRefresh (30 min), because expiring_soon is a
+			// state and would otherwise fire on every tick.
+			for _, acct := range InspectPerAccountCookieHealth() {
+				if acct.Status != "expiring_soon" && acct.Status != "expired" {
+					continue
+				}
+				if !acct.HasProfile {
+					log.Printf("chrome-manage: account %s is %s (ttl=%s) but maps to no profile - skipped", acct.AccountID, acct.Status, acct.MinTTLFormatted)
+					continue
+				}
+				if shouldRequestRefresh(acct.ProfileID) {
+					log.Printf("chrome-manage: account %s is %s (ttl=%s) -> requesting refresh of profile %d", acct.AccountID, acct.Status, acct.MinTTLFormatted, acct.ProfileID)
+					go callChromeManageRefresh(acct.ProfileID)
+				}
+			}
 		}
 	}()
 }
@@ -214,8 +234,25 @@ func GetActiveAccountCount() int {
 }
 
 // ProcessAndSaveCookies stores the received cookies into the account file, updates timestamps, and fires OnCookiesUpdated
-func ProcessAndSaveCookies(cookies []CookieObject) (string, string, error) {
+//
+// profileID, when non-nil and positive, selects the file: cookies/account_profile_<N>.json.
+// That is the farm's own per-profile file, so a chrome-manage refresh UPDATES the account it
+// already has instead of adding a second one for the same Google account.
+//
+// Without it the file is named from the cookie VALUE (getAccountIDFromCookies), which is not
+// stable: __Secure-1PSID rotates, so nearly every refresh produced a hash matching no existing
+// file and minted a brand-new account_<hash>.json. The pool globs account_*.json and loads each
+// as its own worker, so a single Google account ended up served by several workers at once - and
+// with max_concurrency_per_worker: 3 that multiplies the concurrent requests hitting that
+// account, on a farm whose whole premise is avoiding Google lockouts.
+// Measured 2026-09-27: 54 -> 55 workers after a single refresh.
+//
+// The Chrome extension has no profile id and keeps the old behaviour by passing nil.
+func ProcessAndSaveCookies(cookies []CookieObject, profileID *int) (string, string, error) {
 	accountID := getAccountIDFromCookies(cookies)
+	if profileID != nil && *profileID > 0 {
+		accountID = fmt.Sprintf("profile_%d", *profileID)
+	}
 	log.Printf("🍪 Received %d cookies for Account [%s]", len(cookies), accountID)
 
 	lastSyncMu.Lock()
@@ -299,7 +336,9 @@ func StartCookieWebSocketServer(port int) {
 			}
 
 			if msg.Type == "cookies_payload" && len(msg.Cookies) > 0 {
-				_, _, err := ProcessAndSaveCookies(msg.Cookies)
+				// nil profile id: the Chrome extension is not tied to a farm
+				// profile, so this path keeps the cookie-value naming.
+				_, _, err := ProcessAndSaveCookies(msg.Cookies, nil)
 				if err != nil {
 					log.Printf("❌ Failed to process cookies: %v", err)
 				}

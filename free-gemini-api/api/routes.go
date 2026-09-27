@@ -38,23 +38,39 @@ func RegisterRoutes(app *fiber.App) {
 	app.Post("/api/sync-cookies", func(c fiber.Ctx) error {
 		type SyncPayload struct {
 			Cookies []gemini.CookieObject `json:"cookies"`
+			// ProfileID is the farm profile this jar belongs to. chrome-manage
+			// sends it; binding only `cookies` dropped it on the floor, which
+			// made ProcessAndSaveCookies fall back to naming the file from the
+			// cookie VALUE. Because __Secure-1PSID rotates, that minted a NEW
+			// account_<hash>.json on nearly every refresh instead of updating
+			// account_profile_<N>.json - so the pool grew a duplicate worker for
+			// the same Google account each time (measured 2026-09-27: 54 -> 55
+			// after a single refresh).
+			//
+			// Nil for the Chrome extension, which has no profile id and must
+			// keep the old hash naming.
+			ProfileID *int `json:"profile_id"`
 		}
 		var payload SyncPayload
 		if err := c.Bind().JSON(&payload); err != nil || len(payload.Cookies) == 0 {
 			return c.Status(400).JSON(fiber.Map{"error": "Invalid cookies payload"})
 		}
 
-		filePath, accID, err := gemini.ProcessAndSaveCookies(payload.Cookies)
+		filePath, accID, err := gemini.ProcessAndSaveCookies(payload.Cookies, payload.ProfileID)
 		if err != nil {
 			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 		}
 
-		return c.JSON(fiber.Map{
+		resp := fiber.Map{
 			"status":     "success",
 			"account_id": accID,
 			"file_path":  filePath,
 			"count":      len(payload.Cookies),
-		})
+		}
+		if payload.ProfileID != nil {
+			resp["profile_id"] = *payload.ProfileID
+		}
+		return c.JSON(resp)
 	})
 
 	// OpenAI-compatible models list
