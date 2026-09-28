@@ -61,7 +61,11 @@ cd free-gemini-api/free-gemini-api
 docker compose up -d --build
 ```
 
-The server binds to port `8001` (HTTP API) and port `9226` (WebSocket Cookie Bridge).
+The server binds to port `8001` (HTTP API) and port `9226` (WebSocket Cookie Bridge). To remap the host-side API port (e.g. `8001` is already taken on that machine), set `HOST_API_PORT` in a `.env` file next to `docker-compose.yml` — no need to edit the tracked compose file:
+
+```bash
+echo "HOST_API_PORT=8009" > free-gemini-api/.env
+```
 
 ### Option 2: Native Build
 

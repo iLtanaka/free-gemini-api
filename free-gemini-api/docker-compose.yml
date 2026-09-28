@@ -8,7 +8,11 @@ services:
     container_name: free-gemini-api
     restart: unless-stopped
     ports:
-      - "8001:8001"
+      # HOST_API_PORT lets a deployment remap the host-side API port (e.g.
+      # when 8001 is already taken by something else on that machine)
+      # without editing this tracked file - set it in a .env file next to
+      # this docker-compose.yml, or export it before `docker compose up`.
+      - "${HOST_API_PORT:-8001}:8001"
       - "9226:9226"
     environment:
       - TZ=Asia/Kolkata
