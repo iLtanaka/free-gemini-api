@@ -1467,8 +1467,29 @@ func (c *GeminiClient) DownloadFile(urlStr, savePath string) error {
 
 // ReloadSession re-reads the cookies file and marks the session to be re-initialized lazily on the next request
 func (c *GeminiClient) ReloadSession() error {
+	// Same lock Ask*/AskStream* hold for the whole request. Without it, a
+	// cookie push landing mid-request would mutate c.RawCookies/the cookie
+	// jar out from under sendRequest/executeStreamRequest while they're
+	// reading those same fields to build the request - a real data race,
+	// not just a performance concern.
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	prevHash := c.hashCookies()
 	if err := c.loadCookies(); err != nil {
 		return fmt.Errorf("failed to reload cookies: %v", err)
+	}
+
+	// The Chrome extension pushes on every rotation of routine session
+	// tokens (__Secure-1PSIDTS, SIDCC, ...), which Google cycles on its own
+	// schedule regardless of user activity - several times a minute is
+	// normal. If the cookies we just reloaded are byte-identical to what's
+	// already loaded and initialized, this push carried no new information
+	// for THIS account; forcing a full re-init (a live fetch of
+	// gemini.google.com/app) on every such push only adds latency and
+	// extra Google requests for nothing.
+	if c.IsInitialized && c.hashCookies() == prevHash {
+		return nil
 	}
 
 	// Mark as uninitialized and invalidate session cache so the next request gets fresh tokens

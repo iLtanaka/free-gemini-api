@@ -219,4 +219,14 @@ func RegisterRoutes(app *fiber.App) {
 	app.Get("/output/*", func(c fiber.Ctx) error {
 		return c.SendFile("./output/" + c.Params("*"))
 	})
+
+	// Account pool admin UI. The page itself is unauthenticated (it holds
+	// no data), but every mutating/listing call under /admin/api requires
+	// the admin token - see InitAdminAuth.
+	app.Get("/admin", HandleAdminUI)
+	adminAPI := app.Group("/admin/api", adminAuthRequired)
+	adminAPI.Get("/accounts", HandleAdminListAccounts)
+	adminAPI.Put("/accounts/:id/tier", HandleAdminSetTier)
+	adminAPI.Delete("/accounts/:id", HandleAdminDeleteAccount)
+	adminAPI.Get("/usage", HandleAdminUsage)
 }

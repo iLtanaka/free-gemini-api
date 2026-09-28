@@ -93,6 +93,7 @@ func main() {
 	}
 
 	// Start Chrome Extension WebSocket bridge & Multi-Account Worker Pool
+	api.InitAdminAuth()
 	api.StartWebSocketBridge()
 	gemini.StartCookieWatchdog()
 	api.InitWorkerPool()

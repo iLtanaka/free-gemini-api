@@ -233,6 +233,31 @@ func GetActiveAccountCount() int {
 	return len(GetAvailableAccountCookieFiles())
 }
 
+// accountIDPattern matches the account IDs this package itself generates
+// (getAccountIDFromCookies / ProcessAndSaveCookies's "profile_<N>" form) -
+// alphanumeric and underscores only. Used to reject a path-traversal-shaped
+// ID (e.g. "../../etc") before it's interpolated into a filesystem path.
+var accountIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+
+// DeleteAccountCookieFiles removes an account's cookie file and cached
+// session tokens from disk. Used by the admin UI's "remove account" action.
+func DeleteAccountCookieFiles(accountID string) error {
+	if !accountIDPattern.MatchString(accountID) {
+		return fmt.Errorf("invalid account id %q", accountID)
+	}
+
+	cookiePath := filepath.Join("cookies", fmt.Sprintf("account_%s.json", accountID))
+	sessionPath := filepath.Join("cookies", fmt.Sprintf("session_account_%s.json", accountID))
+
+	if err := os.Remove(cookiePath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to remove %s: %w", cookiePath, err)
+	}
+	_ = os.Remove(sessionPath) // best-effort; missing cache file is not an error
+
+	log.Printf("🗑️  Removed account cookie file(s) for [%s]", accountID)
+	return nil
+}
+
 // ProcessAndSaveCookies stores the received cookies into the account file, updates timestamps, and fires OnCookiesUpdated
 //
 // profileID, when non-nil and positive, selects the file: cookies/account_profile_<N>.json.

@@ -10,6 +10,7 @@ High-throughput, OpenAI-compatible proxy engine powered by Google Gemini 3.8 Fla
 - **Distributed Account Pooling**: Aggregates multiple Google accounts into an autonomous worker pool with least-busy routing and rate-limit circuit breakers.
 - **Autonomous Local Network Discovery**: Lightweight Chrome extension dynamically discovers and links with the server across local networks with zero configuration.
 - **Needle 2 SLM Tool Routing**: Sub-millisecond zero-shot function calling and schema extraction via native C++ shared library execution.
+- **Admin Dashboard**: Token-gated web UI to manage the account pool — live usage charts, per-account health, manual tier labels (normal/pro/ultra), and add/remove accounts without touching the filesystem.
 - **Zero-Tab Extraction**: Non-intrusive cookie bridge extracts essential session state directly from browser memory without opening, reloading, or focusing browser tabs.
 - **Production Resilience**: Built on HTTP/3 QUIC with TLS fingerprint simulation, automatic failover, and dual persistence (SQLite WAL + JSON/Excel analytics).
 
@@ -85,6 +86,36 @@ The extension extracts session credentials from active Google sessions and strea
 
 ---
 
+## Admin Dashboard
+
+A token-gated web UI at `/admin` for managing the account pool without shelling into the container — usage charts, per-account health, manual tier labels, and account add/remove.
+
+![Gemini Account Pool admin dashboard](./docs/admin-panel.png)
+
+**Signing in:** on first boot, if `ADMIN_TOKEN` isn't set in the environment, a random token is generated and printed to the logs:
+
+```bash
+docker logs free-gemini-api | grep "Admin UI token"
+```
+
+Paste that token into `/admin` to sign in. Without a fixed `ADMIN_TOKEN`, a new token is generated on every container restart. To keep it stable, set it explicitly in `docker-compose.yml`:
+
+```yaml
+environment:
+  - ADMIN_TOKEN=your-own-fixed-secret-here
+```
+
+**What it does:**
+- **Usage charts** — requests over the last 24h, and requests served per account.
+- **Account table** — live health (`active` / `cooldown` / `recovering`), in-flight/served/error counts, last-used time.
+- **Tiers** — label each account `normal` / `pro` / `ultra` (a manual note for your own routing/bookkeeping, not something scraped from Google).
+- **Add account** — paste an exported cookie JSON array (the same shape `/api/sync-cookies` accepts) instead of relying solely on the Chrome extension.
+- **Delete account** — removes the cookie file and drops it from the pool immediately.
+
+The page itself holds no data, but every `/admin/api/*` call requires `Authorization: Bearer <token>`. `/api/sync-cookies` (used by the Chrome extension and farm tooling) is intentionally left unauthenticated, unchanged.
+
+---
+
 ## API Reference
 
 ### Core Endpoints
@@ -97,6 +128,11 @@ The extension extracts session credentials from active Google sessions and strea
 | `GET` | `/health` | Service health, session TTL, and worker count |
 | `GET` | `/stats` | SQLite usage metrics and token accounting |
 | `GET` | `/help` | Terminal-formatted developer CLI guide |
+| `GET` | `/admin` | Account pool admin dashboard (token-gated) |
+| `GET` | `/admin/api/accounts` | List accounts with tier + live health (requires `Authorization: Bearer <token>`) |
+| `PUT` | `/admin/api/accounts/:id/tier` | Set an account's tier label (requires token) |
+| `DELETE` | `/admin/api/accounts/:id` | Remove an account from the pool (requires token) |
+| `GET` | `/admin/api/usage` | Hourly request counts + aggregate stats for the dashboard charts (requires token) |
 
 ### Example Request
 

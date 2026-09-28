@@ -97,11 +97,45 @@ func InitDB() (*sql.DB, error) {
 			return
 		}
 
+		// tier (normal/pro/ultra, a manually-set label - see SetAccountTier)
+		// was added after the accounts table above shipped, so existing
+		// databases need it backfilled. SQLite has no "ADD COLUMN IF NOT
+		// EXISTS", so check pragma table_info first.
+		if !hasColumn(database, "accounts", "tier") {
+			if _, err := database.Exec(`ALTER TABLE accounts ADD COLUMN tier TEXT DEFAULT 'normal'`); err != nil {
+				initErr = err
+				return
+			}
+		}
+
 		DB = database
 		log.Println("🗄️  SQLite Database initialized successfully at data/gemini.db (WAL Mode)")
 	})
 
 	return DB, initErr
+}
+
+// hasColumn reports whether table has a column named col.
+func hasColumn(database *sql.DB, table, col string) bool {
+	rows, err := database.Query(fmt.Sprintf(`PRAGMA table_info(%s)`, table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notNull, &dflt, &pk); err != nil {
+			continue
+		}
+		if name == col {
+			return true
+		}
+	}
+	return false
 }
 
 // LogMessage saves a chat turn into SQLite
@@ -314,7 +348,7 @@ func GetAccounts() ([]map[string]any, error) {
 	if DB == nil {
 		return nil, nil
 	}
-	rows, err := DB.Query(`SELECT account_id, cookie_file, status, total_requests, last_used_at FROM accounts ORDER BY last_used_at DESC`)
+	rows, err := DB.Query(`SELECT account_id, cookie_file, status, total_requests, last_used_at, COALESCE(tier, 'normal') FROM accounts ORDER BY last_used_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -322,19 +356,60 @@ func GetAccounts() ([]map[string]any, error) {
 
 	var accounts []map[string]any
 	for rows.Next() {
-		var accountID, cookieFile, status, lastUsed string
+		var accountID, cookieFile, status, lastUsed, tier string
 		var totalRequests int
-		if err := rows.Scan(&accountID, &cookieFile, &status, &totalRequests, &lastUsed); err == nil {
+		if err := rows.Scan(&accountID, &cookieFile, &status, &totalRequests, &lastUsed, &tier); err == nil {
 			accounts = append(accounts, map[string]any{
 				"account_id":     accountID,
 				"cookie_file":    cookieFile,
 				"status":         status,
 				"total_requests": totalRequests,
 				"last_used_at":   lastUsed,
+				"tier":           tier,
 			})
 		}
 	}
 	return accounts, nil
+}
+
+// ValidAccountTiers are the only tier labels SetAccountTier accepts. This is
+// a manual label the operator sets (see api/admin.go) - Gemini's actual
+// Free/Pro/Ultra subscription level isn't scraped from anywhere, since
+// there's no stable, documented place to read it from the web app.
+var ValidAccountTiers = map[string]bool{"normal": true, "pro": true, "ultra": true}
+
+// SetAccountTier updates the manual tier label for an account. Inserts a row
+// if the account hasn't been seen by RecordAccountUsage yet (e.g. it was
+// just added and hasn't served a request), so the label sticks once it does.
+func SetAccountTier(accountID, cookieFile, tier string) error {
+	if DB == nil {
+		return fmt.Errorf("database not initialized")
+	}
+	if !ValidAccountTiers[tier] {
+		return fmt.Errorf("invalid tier %q (must be normal, pro, or ultra)", tier)
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
+	query := `
+	INSERT INTO accounts (account_id, cookie_file, status, total_requests, last_used_at, tier)
+	VALUES (?, ?, 'active', 0, CURRENT_TIMESTAMP, ?)
+	ON CONFLICT(account_id) DO UPDATE SET tier = excluded.tier;
+	`
+	_, err := DB.Exec(query, accountID, cookieFile, tier)
+	return err
+}
+
+// DeleteAccount removes an account's tracked row (its cookie file is removed
+// separately by the caller - see gemini.DeleteAccountCookieFiles).
+func DeleteAccount(accountID string) error {
+	if DB == nil {
+		return nil
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	_, err := DB.Exec(`DELETE FROM accounts WHERE account_id = ?`, accountID)
+	return err
 }
 
 // GetAllMessagesForExport fetches messages for Excel and JSON export in chronological order (User first, Assistant next)
@@ -432,6 +507,48 @@ func GetAllRequestLogsForExport() ([]map[string]any, error) {
 		}
 	}
 	return list, nil
+}
+
+// GetHourlyRequestCounts returns request counts for each of the last `hours`
+// hours (oldest first), zero-filled so a quiet hour shows as 0 rather than
+// being skipped - the admin usage chart needs a bar for every slot.
+func GetHourlyRequestCounts(hours int) ([]map[string]any, error) {
+	if hours <= 0 {
+		hours = 24
+	}
+	now := time.Now().UTC().Truncate(time.Hour)
+
+	counts := map[string]int{}
+	if DB != nil {
+		rows, err := DB.Query(`
+			SELECT strftime('%Y-%m-%dT%H:00:00', created_at) as bucket, COUNT(*) as cnt
+			FROM request_logs
+			WHERE created_at >= datetime('now', ?)
+			GROUP BY bucket
+		`, fmt.Sprintf("-%d hours", hours))
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var bucket string
+			var cnt int
+			if err := rows.Scan(&bucket, &cnt); err == nil {
+				counts[bucket] = cnt
+			}
+		}
+	}
+
+	result := make([]map[string]any, 0, hours)
+	for i := hours - 1; i >= 0; i-- {
+		bucketTime := now.Add(-time.Duration(i) * time.Hour)
+		key := bucketTime.Format("2006-01-02T15:00:00")
+		result = append(result, map[string]any{
+			"hour":  key,
+			"count": counts[key],
+		})
+	}
+	return result, nil
 }
 
 // GetUSDToINRRate returns the exchange rate (default: 95.89 INR/USD, configurable via USD_TO_INR env var)

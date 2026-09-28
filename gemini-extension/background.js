@@ -270,23 +270,52 @@ async function performSync() {
 }
 
 // ─── Real-Time Passive Cookie Listener ──────────────────────────────────────
-// Auto-detect when Google rotates session cookies and push them instantly (zero CPU idle)
+// Auto-detect when Google rotates session cookies and push them.
+//
+// Identity cookies (SID/__Secure-1PSID/...) only change on an actual
+// login/logout/account-switch, so those get pushed promptly. The rest
+// (__Secure-1PSIDTS, SIDCC, ...) are session tokens Google rotates on its
+// own schedule as routine background refresh - several times a minute is
+// normal, unrelated to whether the account is even still logged in the same
+// way. Pushing on every single one of those made the backend re-run its
+// full session-init handshake against gemini.google.com constantly (see
+// GeminiClient.ReloadSession), adding latency and occasionally visible
+// glitchy replies with no actual change on this end - so those get a much
+// longer debounce; a request only needs cookies this fresh, not
+// millisecond-fresh.
+const IDENTITY_COOKIE_NAMES = new Set(['SID', 'HSID', '__Secure-1PSID', '__Secure-3PSID']);
+const IDENTITY_DEBOUNCE_MS = 1500;
+const ROTATION_DEBOUNCE_MS = 60000;
+
+let rotationDebounceTimeout = null;
+
 chrome.cookies.onChanged.addListener((changeInfo) => {
   const cookie = changeInfo.cookie;
-  
-  const isTargetDomain = cookie.domain === '.google.com' || 
-                         cookie.domain === '.google.co' || 
+
+  const isTargetDomain = cookie.domain === '.google.com' ||
+                         cookie.domain === '.google.co' ||
                          cookie.domain === 'gemini.google.com' ||
                          cookie.domain.includes('googleusercontent.com');
 
   if (isTargetDomain && ALLOWED_COOKIE_NAMES.has(cookie.name)) {
     if (changeInfo.removed) return;
 
-    // Debounce multiple fast updates (Google rotates 2-3 tokens in a single batch)
-    if (syncDebounceTimeout) clearTimeout(syncDebounceTimeout);
-    syncDebounceTimeout = setTimeout(() => {
-      performSync();
-    }, 1500);
+    if (IDENTITY_COOKIE_NAMES.has(cookie.name)) {
+      // A real login/logout/account switch: sync soon, and don't make it
+      // wait behind a pending routine-rotation sync.
+      if (syncDebounceTimeout) clearTimeout(syncDebounceTimeout);
+      syncDebounceTimeout = setTimeout(() => {
+        performSync();
+      }, IDENTITY_DEBOUNCE_MS);
+    } else {
+      // Routine token rotation: coalesce into one push per minute at most.
+      if (!rotationDebounceTimeout) {
+        rotationDebounceTimeout = setTimeout(() => {
+          rotationDebounceTimeout = null;
+          performSync();
+        }, ROTATION_DEBOUNCE_MS);
+      }
+    }
   }
 });
 
