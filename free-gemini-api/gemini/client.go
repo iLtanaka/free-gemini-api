@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	http "github.com/bogdanfinn/fhttp"
@@ -98,6 +99,14 @@ type GeminiClient struct {
 	IsInitialized  bool
 	RawCookies     string
 	SessionSavedAt int64
+
+	// mu serializes every request-issuing call on this client. A single
+	// GeminiClient is shared across concurrent requests (worker pool
+	// affinity, cached user sessions), but ConversationID/ResponseID/
+	// ChoiceID/ReqID are plain mutable fields with no other synchronization,
+	// so two in-flight requests on the same client would race on them and
+	// could cross-contaminate each other's Gemini conversation context.
+	mu sync.Mutex
 }
 
 type CookieObject struct {
@@ -393,8 +402,44 @@ func (c *GeminiClient) Ask(prompt string) (*GeminiResponse, error) {
 
 // AskStream sends a prompt and streams text chunks via callback as they arrive
 func (c *GeminiClient) AskStream(prompt string, onChunk func(text string)) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.askStreamLocked(prompt, onChunk)
+}
+
+// AskStreamFresh resets the conversation state and streams a prompt with no
+// carried-over Gemini context. The reset and the request happen under the
+// same lock so a concurrent caller on this client can never observe (or
+// clobber) a half-reset state. Used by the OpenAI-compatible endpoint,
+// which sends full history per request and must never merge unrelated
+// chats into one Gemini conversation.
+func (c *GeminiClient) AskStreamFresh(prompt string, onChunk func(text string)) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ConversationID = ""
+	c.ResponseID = ""
+	c.ChoiceID = ""
+	return c.askStreamLocked(prompt, onChunk)
+}
+
+// AskStreamContinue restores a previously-seen Gemini conversation
+// (conversationID/responseID/choiceID) and streams the next turn against it,
+// sending only the new prompt — Gemini supplies the rest of the context
+// server-side. The caller must guarantee this runs against the same
+// account/session that originally produced those IDs; otherwise Gemini will
+// error or silently start an unrelated thread.
+func (c *GeminiClient) AskStreamContinue(conversationID, responseID, choiceID, prompt string, onChunk func(text string)) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ConversationID = conversationID
+	c.ResponseID = responseID
+	c.ChoiceID = choiceID
+	return c.askStreamLocked(prompt, onChunk)
+}
+
+func (c *GeminiClient) askStreamLocked(prompt string, onChunk func(text string)) (*GeminiResponse, error) {
 	start := time.Now()
-	
+
 	var response *GeminiResponse
 	execErr := c.executeWithRetry("AskStream", func() error {
 		var err error
@@ -663,6 +708,9 @@ func (c *GeminiClient) AskWithImage(prompt string, imageBytes []byte, filename s
 }
 
 func (c *GeminiClient) AskWithImages(prompt string, images []ImageInput) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	start := time.Now()
 
 	if err := c.ensureInit(); err != nil {
@@ -804,6 +852,39 @@ func (c *GeminiClient) pollVideoURL(response *GeminiResponse) {
 }
 
 func (c *GeminiClient) AskWithTool(prompt string, tool string) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.askWithToolLocked(prompt, tool)
+}
+
+// AskFresh resets the conversation state and asks a prompt with no
+// carried-over Gemini context. See AskStreamFresh for why the reset must
+// happen under the same lock as the request itself.
+func (c *GeminiClient) AskFresh(prompt string) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ConversationID = ""
+	c.ResponseID = ""
+	c.ChoiceID = ""
+	return c.askWithToolLocked(prompt, "")
+}
+
+// AskContinue restores a previously-seen Gemini conversation
+// (conversationID/responseID/choiceID) and asks the next turn against it,
+// sending only the new prompt — Gemini supplies the rest of the context
+// server-side. The caller must guarantee this runs against the same
+// account/session that originally produced those IDs; otherwise Gemini will
+// error or silently start an unrelated thread.
+func (c *GeminiClient) AskContinue(conversationID, responseID, choiceID, prompt string) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ConversationID = conversationID
+	c.ResponseID = responseID
+	c.ChoiceID = choiceID
+	return c.askWithToolLocked(prompt, "")
+}
+
+func (c *GeminiClient) askWithToolLocked(prompt string, tool string) (*GeminiResponse, error) {
 	start := time.Now()
 	if err := c.ensureInit(); err != nil {
 		return nil, err
@@ -877,6 +958,9 @@ func (c *GeminiClient) AskWithTool(prompt string, tool string) (*GeminiResponse,
 // AskVideo generates a video via chat prompt and polls hNvQHb for download URL.
 // Flow: sendRequest(prompt) → poll hNvQHb(convID) for contribution.usercontent URL
 func (c *GeminiClient) AskVideo(prompt string) (*GeminiResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	start := time.Now()
 	if err := c.ensureInit(); err != nil {
 		return nil, err

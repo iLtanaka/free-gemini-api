@@ -137,6 +137,16 @@ func (p *WorkerPool) BindAffinity(key, accountID string) {
 	}
 }
 
+// LookupAffinity returns the worker/account ID currently bound to key, if any.
+func (p *WorkerPool) LookupAffinity(key string) (string, bool) {
+	v, ok := p.affinityMap.Load(key)
+	if !ok {
+		return "", false
+	}
+	id, ok := v.(string)
+	return id, ok
+}
+
 // AcquireWorker selects the best available worker using Sticky Affinity or Least-Busy routing
 func (p *WorkerPool) AcquireWorker(ctx context.Context, affinityKey string) (*AccountWorker, error) {
 	timeout := 45 * time.Second
@@ -320,11 +330,15 @@ func (p *WorkerPool) ExecuteQueuedStream(ctx context.Context, affinityKey string
 	if err != nil {
 		return fmt.Errorf("failed to acquire worker for streaming: %w", err)
 	}
-	defer p.ReleaseWorker(worker, nil)
 
+	// Released exactly once, with the real outcome: the previous code also
+	// had `defer p.ReleaseWorker(worker, nil)` running unconditionally,
+	// which on the error path released the worker a second time (double
+	// decrementing InFlight, and overwriting the just-recorded error status
+	// with a spurious "success").
 	streamErr := op(worker.Client)
+	p.ReleaseWorker(worker, streamErr)
 	if streamErr != nil {
-		p.ReleaseWorker(worker, streamErr)
 		return streamErr
 	}
 
@@ -335,6 +349,62 @@ func (p *WorkerPool) ExecuteQueuedStream(ctx context.Context, affinityKey string
 		}
 	}
 	return nil
+}
+
+// acquireSpecificWorker grabs the exact worker identified by workerID, with
+// no least-busy fallback to a different account. Continuing a Gemini
+// conversation only works on the Google account session that started it, so
+// unlike AcquireWorker this must never silently reroute elsewhere — callers
+// are expected to fall back to a fresh (non-continuation) request on error.
+func (p *WorkerPool) acquireSpecificWorker(workerID string) (*AccountWorker, error) {
+	p.mu.RLock()
+	var worker *AccountWorker
+	for _, w := range p.workers {
+		if w.ID == workerID {
+			worker = w
+			break
+		}
+	}
+	p.mu.RUnlock()
+
+	if worker == nil {
+		return nil, fmt.Errorf("worker %s is no longer in the pool", workerID)
+	}
+	if !worker.IsHealthy() {
+		return nil, fmt.Errorf("worker %s is unhealthy", workerID)
+	}
+	if atomic.LoadInt64(&worker.InFlight) >= p.maxConcurrencyPerWorker {
+		return nil, fmt.Errorf("worker %s is at capacity", workerID)
+	}
+
+	atomic.AddInt64(&worker.InFlight, 1)
+	worker.mu.Lock()
+	worker.LastUsed = time.Now()
+	worker.mu.Unlock()
+	return worker, nil
+}
+
+// ExecuteOnWorker runs op on the exact worker identified by workerID. See
+// acquireSpecificWorker for why this never reroutes to another account.
+func (p *WorkerPool) ExecuteOnWorker(workerID string, op func(*gemini.GeminiClient) (*gemini.GeminiResponse, error)) (*gemini.GeminiResponse, error) {
+	worker, err := p.acquireSpecificWorker(workerID)
+	if err != nil {
+		return nil, err
+	}
+	resp, opErr := op(worker.Client)
+	p.ReleaseWorker(worker, opErr)
+	return resp, opErr
+}
+
+// ExecuteOnWorkerStream is the streaming counterpart of ExecuteOnWorker.
+func (p *WorkerPool) ExecuteOnWorkerStream(workerID string, op func(*gemini.GeminiClient) error) error {
+	worker, err := p.acquireSpecificWorker(workerID)
+	if err != nil {
+		return err
+	}
+	opErr := op(worker.Client)
+	p.ReleaseWorker(worker, opErr)
+	return opErr
 }
 
 // WorkerPoolStats represents the live metrics of the worker pool

@@ -1,5 +1,10 @@
 package api
 
+import (
+	"encoding/json"
+	"strings"
+)
+
 type OpenAIToolCallFunction struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
@@ -17,6 +22,60 @@ type OpenAIChatMessage struct {
 	Name       string           `json:"name,omitempty"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	ToolCalls  []OpenAIToolCall `json:"tool_calls,omitempty"`
+}
+
+// openAIChatMessageAlias avoids infinite recursion into UnmarshalJSON below.
+type openAIChatMessageAlias OpenAIChatMessage
+
+// UnmarshalJSON accepts content as a plain string (standard OpenAI shape),
+// null, or an array of content parts (e.g. Open WebUI's
+// [{"type":"text","text":"..."}, {"type":"image_url",...}]). Non-text parts
+// (images, etc.) are dropped; text parts are concatenated in order.
+func (m *OpenAIChatMessage) UnmarshalJSON(data []byte) error {
+	aux := struct {
+		Content json.RawMessage `json:"content"`
+		*openAIChatMessageAlias
+	}{
+		openAIChatMessageAlias: (*openAIChatMessageAlias)(m),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+
+	if len(aux.Content) == 0 || string(aux.Content) == "null" {
+		m.Content = nil
+		return nil
+	}
+
+	var s string
+	if err := json.Unmarshal(aux.Content, &s); err == nil {
+		m.Content = &s
+		return nil
+	}
+
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(aux.Content, &parts); err == nil {
+		var sb strings.Builder
+		for _, p := range parts {
+			if p.Text == "" {
+				continue
+			}
+			if sb.Len() > 0 {
+				sb.WriteString("\n")
+			}
+			sb.WriteString(p.Text)
+		}
+		joined := sb.String()
+		m.Content = &joined
+		return nil
+	}
+
+	// Unknown shape: leave Content nil rather than failing the whole request.
+	m.Content = nil
+	return nil
 }
 
 type OpenAIChatCompletionRequest struct {

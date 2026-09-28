@@ -156,6 +156,15 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 		c.Set("Connection", "keep-alive")
 		c.Set("X-Accel-Buffering", "no")
 
+		// Captured up front, not inside the SendStreamWriter callback: that
+		// callback runs in a goroutine fasthttp spins up to pump the stream,
+		// which can outlive the point where the client disconnects and
+		// fasthttp recycles the RequestCtx. Calling c.IP()/c.Host() from
+		// inside the callback after that point dereferences a nil/reused
+		// conn and segfaults the whole process, not just this request.
+		userIP := c.IP()
+		hostStr := c.Host()
+
 		return c.SendStreamWriter(func(w *bufio.Writer) {
 			streamResp, streamErr := client.AskStream(prompt, func(chunk string) {
 				data, _ := json.Marshal(fiber.Map{"text": chunk})
@@ -177,7 +186,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 						filename = fmt.Sprintf("img_%d_%d.png", time.Now().Unix(), i)
 					}
 					if err := DownloadAndClean(client, imgURL, filename, "image"); err == nil {
-						streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+						streamResp.Images[i] = fmt.Sprintf("http://%s/output/%s", hostStr, filename)
 					}
 				}
 			}
@@ -190,7 +199,7 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 						filename = fmt.Sprintf("vid_%d_0.mp4", time.Now().Unix())
 					}
 					if err := DownloadAndClean(client, vidURL, filename, "video"); err == nil {
-						streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", c.Host(), filename)
+						streamResp.Videos[0] = fmt.Sprintf("http://%s/output/%s", hostStr, filename)
 					}
 				}
 			}
@@ -200,7 +209,6 @@ func HandleUnifiedChat(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
 			go func() {
 				pTokens := CountTokens(prompt)
 				rTokens := CountTokens(streamResp.Text)
@@ -302,8 +310,18 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	var prompt string
 	hasToolResults := false
 	var fullPromptBuilder strings.Builder
+	messageCount := len(req.Messages)
+	// historyPrefix snapshots the formatted transcript of every message
+	// EXCEPT the last one — i.e. exactly what the next request's prefix
+	// will look like once this turn's exchange is appended to it. Used to
+	// recognize a continuing conversation (see conversationFingerprint).
+	var historyPrefix string
 
-	for _, m := range req.Messages {
+	for i, m := range req.Messages {
+		if i == messageCount-1 {
+			historyPrefix = fullPromptBuilder.String()
+		}
+
 		contentStr := ""
 		if m.Content != nil {
 			contentStr = *m.Content
@@ -325,6 +343,7 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			fullPromptBuilder.WriteString("[System]: " + contentStr + "\n")
 		}
 	}
+	lastMsg := req.Messages[messageCount-1]
 
 	if prompt == "" && len(req.Messages) > 0 {
 		lastM := req.Messages[len(req.Messages)-1]
@@ -397,10 +416,30 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// The OpenAI client sends the full conversation in "messages" on every
+	// request (there is no server-side session on their side), so once
+	// there's more than one message we must replay the whole transcript as
+	// the prompt — otherwise only the last user message survives and Gemini
+	// never sees prior turns. This is the always-available fallback path.
 	askPrompt := prompt
-	if hasToolResults {
+	if messageCount > 1 {
 		fullPromptBuilder.WriteString("Assistant: ")
 		askPrompt = fullPromptBuilder.String()
+	}
+
+	// Opportunistic optimization: if historyPrefix matches a Gemini
+	// conversation we already have open (see conversationFingerprint), skip
+	// resending the whole transcript and just send the new message —
+	// Gemini remembers the rest server-side. Only tried for a request that
+	// plainly ends in a fresh user turn; tool-call flows keep using the
+	// full-transcript path above. Any miss or failure below falls back to
+	// that full-transcript path, so correctness never depends on this
+	// succeeding — it only ever saves bytes and latency.
+	var linkedState *linkedConversation
+	if messageCount > 1 && lastMsg.Role == "user" {
+		if lc, ok := loadLinkedConversation(conversationFingerprint(sessionID, historyPrefix)); ok {
+			linkedState = &lc
+		}
 	}
 
 	pool := GetWorkerPool()
@@ -411,36 +450,101 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		c.Set("Connection", "keep-alive")
 		c.Set("X-Accel-Buffering", "no")
 
+		// Must be captured before SendStreamWriter, not inside its callback.
+		// The callback runs in a goroutine fasthttp spins up to pump the
+		// stream (see fasthttp.NewStreamReader); by the time it finishes
+		// writing, the client may already have disconnected and fasthttp can
+		// have torn down/recycled the RequestCtx concurrently. Calling
+		// c.IP() from inside the callback then dereferences a nil/reused
+		// conn and segfaults the ENTIRE process (not just the request) —
+		// this reproduced the exact "connection reset by peer" / crash-loop
+		// symptom seen during testing.
+		userIP := c.IP()
+
 		return c.SendStreamWriter(func(w *bufio.Writer) {
+			// SendStreamWriter runs this callback after HandleOpenAIChatCompletions
+			// has already returned, so the outer `ctx` (cancelled by its `defer
+			// cancel()` on handler return) is dead before we ever get here. Use a
+			// context scoped to the callback's own lifetime instead.
+			streamCtx, streamCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer streamCancel()
+
 			chunkID := "chatcmpl-" + uuid.NewString()[:12]
 			createdTime := time.Now().Unix()
 
-			streamErr := pool.ExecuteQueuedStream(ctx, sessionID, func(cl *gemini.GeminiClient) error {
-				_, err := cl.AskStream(askPrompt, func(chunk string) {
-					chunkResp := OpenAIChatCompletionChunk{
-						ID:      chunkID,
-						Object:  "chat.completion.chunk",
-						Created: createdTime,
-						Model:   model,
-						Choices: []OpenAIStreamChoice{
-							{
-								Index: 0,
-								Delta: OpenAIDelta{
-									Content: chunk,
-								},
+			emitChunk := func(chunk string) {
+				chunkResp := OpenAIChatCompletionChunk{
+					ID:      chunkID,
+					Object:  "chat.completion.chunk",
+					Created: createdTime,
+					Model:   model,
+					Choices: []OpenAIStreamChoice{
+						{
+							Index: 0,
+							Delta: OpenAIDelta{
+								Content: chunk,
 							},
 						},
-					}
-					data, _ := json.Marshal(chunkResp)
-					fmt.Fprintf(w, "data: %s\n\n", data)
-					w.Flush()
+					},
+				}
+				data, _ := json.Marshal(chunkResp)
+				fmt.Fprintf(w, "data: %s\n\n", data)
+				w.Flush()
+			}
+
+			var streamResp *gemini.GeminiResponse
+			var streamErr error
+			usedWorkerID := ""
+
+			if linkedState != nil {
+				streamErr = pool.ExecuteOnWorkerStream(linkedState.WorkerID, func(cl *gemini.GeminiClient) error {
+					var err error
+					streamResp, err = cl.AskStreamContinue(linkedState.ConversationID, linkedState.ResponseID, linkedState.ChoiceID, prompt, emitChunk)
+					return err
 				})
-				return err
-			})
+				if streamErr == nil {
+					usedWorkerID = linkedState.WorkerID
+				} else {
+					log.Printf("⚠️ Conversation link unavailable, starting a fresh Gemini chat: %v", streamErr)
+					linkedState = nil
+				}
+			}
+
+			if linkedState == nil {
+				streamErr = pool.ExecuteQueuedStream(streamCtx, sessionID, func(cl *gemini.GeminiClient) error {
+					var err error
+					streamResp, err = cl.AskStreamFresh(askPrompt, emitChunk)
+					return err
+				})
+			}
 
 			if streamErr != nil {
 				log.Printf("❌ Streaming error: %v", streamErr)
+				errChunk, _ := json.Marshal(fiber.Map{
+					"error": fiber.Map{
+						"message": streamErr.Error(),
+						"type":    "server_error",
+					},
+				})
+				fmt.Fprintf(w, "data: %s\n\n", errChunk)
+				fmt.Fprintf(w, "data: [DONE]\n\n")
+				w.Flush()
 				return
+			}
+
+			if usedWorkerID == "" {
+				if wID, ok := pool.LookupAffinity(streamResp.ConversationID); ok {
+					usedWorkerID = wID
+				}
+			}
+			if usedWorkerID != "" && streamResp.ConversationID != "" && lastMsg.Role == "user" && streamResp.Text != "" {
+				nextTranscript := historyPrefix + "User: " + prompt + "\n" + "Assistant: " + streamResp.Text + "\n"
+				storeLinkedConversation(conversationFingerprint(sessionID, nextTranscript), linkedConversation{
+					ConversationID: streamResp.ConversationID,
+					ResponseID:     streamResp.ResponseID,
+					ChoiceID:       streamResp.ChoiceID,
+					WorkerID:       usedWorkerID,
+				})
 			}
 
 			finalResp := OpenAIChatCompletionChunk{
@@ -460,7 +564,6 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 			fmt.Fprintf(w, "data: [DONE]\n\n")
 			w.Flush()
 
-			userIP := c.IP()
 			go func() {
 				db.LogRequest("/v1/chat/completions", "POST", userIP, 200, float64(time.Now().Unix()-createdTime)*1000)
 				AutoExportAnalytics()
@@ -468,14 +571,48 @@ func HandleOpenAIChatCompletions(c fiber.Ctx) error {
 		})
 	}
 
-	resp, err := pool.ExecuteQueued(ctx, sessionID, func(cl *gemini.GeminiClient) (*gemini.GeminiResponse, error) {
-		return cl.Ask(askPrompt)
-	})
+	var resp *gemini.GeminiResponse
+	var err error
+	usedWorkerID := ""
+
+	if linkedState != nil {
+		resp, err = pool.ExecuteOnWorker(linkedState.WorkerID, func(cl *gemini.GeminiClient) (*gemini.GeminiResponse, error) {
+			return cl.AskContinue(linkedState.ConversationID, linkedState.ResponseID, linkedState.ChoiceID, prompt)
+		})
+		if err == nil {
+			usedWorkerID = linkedState.WorkerID
+		} else {
+			log.Printf("⚠️ Conversation link unavailable, starting a fresh Gemini chat: %v", err)
+			linkedState = nil
+		}
+	}
+
+	if linkedState == nil {
+		resp, err = pool.ExecuteQueued(ctx, sessionID, func(cl *gemini.GeminiClient) (*gemini.GeminiResponse, error) {
+			return cl.AskFresh(askPrompt)
+		})
+	}
+
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return c.Status(504).JSON(fiber.Map{"error": "Request timed out in worker queue."})
 		}
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	if usedWorkerID == "" {
+		if wID, ok := pool.LookupAffinity(resp.ConversationID); ok {
+			usedWorkerID = wID
+		}
+	}
+	if usedWorkerID != "" && resp.ConversationID != "" && lastMsg.Role == "user" && resp.Text != "" {
+		nextTranscript := historyPrefix + "User: " + prompt + "\n" + "Assistant: " + resp.Text + "\n"
+		storeLinkedConversation(conversationFingerprint(sessionID, nextTranscript), linkedConversation{
+			ConversationID: resp.ConversationID,
+			ResponseID:     resp.ResponseID,
+			ChoiceID:       resp.ChoiceID,
+			WorkerID:       usedWorkerID,
+		})
 	}
 
 	respContent := resp.Text
