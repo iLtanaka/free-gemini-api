@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ import (
 	http "github.com/bogdanfinn/fhttp"
 	tls_client "github.com/bogdanfinn/tls-client"
 	"github.com/bogdanfinn/tls-client/profiles"
+	"github.com/google/uuid"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
@@ -33,7 +35,12 @@ var chromeHeaderOrder = []string{
 	"sec-ch-ua-platform",
 	"sec-ch-ua-arch",
 	"sec-ch-ua-bitness",
+	"sec-ch-ua-form-factors",
 	"sec-ch-ua-full-version",
+	"sec-ch-ua-full-version-list",
+	"sec-ch-ua-model",
+	"sec-ch-ua-platform-version",
+	"sec-ch-ua-wow64",
 	"user-agent",
 	"accept",
 	"accept-encoding",
@@ -43,9 +50,14 @@ var chromeHeaderOrder = []string{
 	"origin",
 	"referer",
 	"x-same-domain",
+	"x-browser-channel",
+	"x-browser-copyright",
+	"x-browser-year",
+	"x-client-data",
 	"x-goog-ext-525001261-jspb",
 	"x-goog-ext-525005358-jspb",
 	"x-goog-ext-73010989-jspb",
+	"x-goog-ext-73010990-jspb",
 	"priority",
 }
 
@@ -69,12 +81,71 @@ func getPlatformDetails() (ua string, platform string, secChUa string) {
 
 var (
 	CurrentChromeUA, CurrentPlatform, CurrentSecChUa = getPlatformDetails()
+
+	// The rest of Chrome's Client-Hint header family. Kept at "152.0.0.0"
+	// throughout (matching the Chrome/152 in CurrentChromeUA/CurrentSecChUa
+	// above and the tls-client profiles.Chrome_152 TLS fingerprint used in
+	// NewClient) rather than a newer real-world Chrome build number: a
+	// version string ahead of what the TLS ClientHello actually presents
+	// would be its own, more obvious inconsistency than being a few Chrome
+	// releases behind but internally consistent.
+	CurrentSecChUaFullVersion     = `"152.0.0.0"`
+	CurrentSecChUaFullVersionList = `"Not(A:Brand";v="99.0.0.0", "Google Chrome";v="152.0.0.0", "Chromium";v="152.0.0.0"`
 )
+
+// x-client-data is Chrome's opaque field-trial/experiment-bucketing blob.
+// It isn't something we can correctly regenerate (it's assigned by Chrome
+// itself, not derived from request content), so this is a static value
+// copied from a real Chrome capture - present rather than absent, not
+// guaranteed to still reflect a live assignment.
+const chromeXClientData = "CJS2yQEIpLbJAQipncoBCJahywEIh6DNAQjA4ZQwCLDilDAI4eSUMAiD5ZQwCNfolDAI/OmUMAiQ7JQwGK3glDA="
 
 // Flash model header value (hardcoded since we only use Flash)
 const flashModelID = "56fdd199312815e2"
 
-var flashHeaderValue = fmt.Sprintf(`[1,null,null,null,"%s",null,null,0,[4],null,null,2]`, flashModelID)
+// geminiLanguage drives both the request payload's language field and the
+// "hl" URL query param. A real browser always sets both, derived from the
+// account's language setting; a prior version of this code set the payload
+// field but never added "hl" to the URL at all, leaving the two visibly
+// inconsistent with each other.
+const geminiLanguage = "en-GB"
+
+// headerSetter is implemented by both net/http.Header and
+// github.com/bogdanfinn/fhttp.Header (this file uses net/http for the QUIC
+// requests and fhttp for the HTTP/2 ones - two different concrete types,
+// same Set method), letting setBrowserHeaders serve all four request
+// builders below instead of duplicating this per call site.
+type headerSetter interface {
+	Set(key, value string)
+}
+
+// setBrowserHeaders applies the Chrome Client-Hint and browser-identity
+// headers a real StreamGenerate request carries. A prior version of this
+// codebase only sent sec-ch-ua/-mobile/-platform and omitted the rest of
+// this family entirely; diffing our traffic against a real Chrome DevTools
+// capture (while chasing an intermittent "Sorry, something went wrong"
+// reply from Gemini) showed the gap. Not present: x-browser-validation,
+// which looks like a signed integrity token computed by Chrome itself -
+// there's no way to correctly derive it from outside the browser, and
+// replaying a captured value on a different request would be more
+// obviously wrong than omitting the header.
+func setBrowserHeaders(h headerSetter) {
+	h.Set("sec-ch-ua", CurrentSecChUa)
+	h.Set("sec-ch-ua-mobile", "?0")
+	h.Set("sec-ch-ua-platform", CurrentPlatform)
+	h.Set("sec-ch-ua-arch", `"x86"`)
+	h.Set("sec-ch-ua-bitness", `"64"`)
+	h.Set("sec-ch-ua-form-factors", `"Desktop"`)
+	h.Set("sec-ch-ua-full-version", CurrentSecChUaFullVersion)
+	h.Set("sec-ch-ua-full-version-list", CurrentSecChUaFullVersionList)
+	h.Set("sec-ch-ua-model", `""`)
+	h.Set("sec-ch-ua-platform-version", `""`)
+	h.Set("sec-ch-ua-wow64", "?0")
+	h.Set("x-browser-channel", "stable")
+	h.Set("x-browser-year", strconv.Itoa(time.Now().Year()))
+	h.Set("x-browser-copyright", fmt.Sprintf("Copyright %d Google LLC. All Rights Reserved.", time.Now().Year()))
+	h.Set("x-client-data", chromeXClientData)
+}
 
 type SavedSessionData struct {
 	SNlM0e         string `json:"snlm0e"`
@@ -99,6 +170,17 @@ type GeminiClient struct {
 	IsInitialized  bool
 	RawCookies     string
 	SessionSavedAt int64
+
+	// sessionUUID/requestUUID stand in for the per-tab identity fields a
+	// real browser carries in x-goog-ext-525001261-jspb's tail and
+	// x-goog-ext-525005358-jspb respectively. Generated once per client
+	// (mirroring a browser tab's lifetime) rather than per-request, and
+	// real UUIDs rather than the placeholder literal "DIRECT-API-SESSION"
+	// this code used to send - a static, human-readable label sitting in a
+	// field shaped like a UUID everywhere else is a clean non-browser tell.
+	sessionUUID  string
+	requestUUID  string
+	sessionStart time.Time
 
 	// mu serializes every request-issuing call on this client. A single
 	// GeminiClient is shared across concurrent requests (worker pool
@@ -154,11 +236,14 @@ func NewClient(cookiesFile string) (*GeminiClient, error) {
 	}
 
 	c := &GeminiClient{
-		client:      client,
-		quicClient: quicClient,
-		useQUIC:     true,
-		cookiesFile: cookiesFile,
-		ReqID:       rand.Intn(9000000) + 1000000,
+		client:       client,
+		quicClient:   quicClient,
+		useQUIC:      true,
+		cookiesFile:  cookiesFile,
+		ReqID:        rand.Intn(9000000) + 1000000,
+		sessionUUID:  uuid.NewString(),
+		requestUUID:  uuid.NewString(),
+		sessionStart: time.Now(),
 	}
 
 	if err := c.loadCookies(); err != nil {
@@ -241,6 +326,38 @@ func (c *GeminiClient) getSessionCachePath() string {
 func (c *GeminiClient) hashCookies() string {
 	h := sha256.Sum256([]byte(c.RawCookies))
 	return hex.EncodeToString(h[:])
+}
+
+// flashHeaderValue builds x-goog-ext-525001261-jspb. Structure matches a
+// real Chrome StreamGenerate capture: a prior version sent
+// [1,null,null,null,"<model>",null,null,0,[4],null,null,2] - a truncated
+// capability array ([4] instead of the real 10-flag list) with no session
+// identity tail at all. The trailing timing pair's exact semantics aren't
+// documented anywhere public; [msSinceSessionStart, [nowUnixSec,
+// nowNanos]] matches the observed shape (a small-int pair followed by a
+// unix-time-shaped pair) but is a best-effort structural match, not a
+// confirmed-correct replay of whatever Chrome actually measures there.
+func (c *GeminiClient) flashHeaderValue() string {
+	// A real capture's value here (37100000) next to a session that was
+	// roughly 37.1s old lines up with microseconds, not milliseconds.
+	elapsedUs := time.Since(c.sessionStart).Microseconds()
+	now := time.Now()
+	payload := []interface{}{
+		1, nil, nil, nil, flashModelID, nil, nil, 0,
+		[]int{4, 5, 6, 8, 16, 4, 5, 6, 8, 16},
+		nil, nil, 2, nil, nil, 1, 1, c.sessionUUID, nil, nil,
+		[][]interface{}{{nil, elapsedUs}, {now.Unix(), now.Nanosecond()}},
+	}
+	b, _ := json.Marshal(payload)
+	return string(b)
+}
+
+// requestSessionHeaderValue builds x-goog-ext-525005358-jspb. A prior
+// version hardcoded the literal string "DIRECT-API-SESSION" here - in a
+// field every real request fills with an actual UUID, a human-readable
+// label is about as clean a non-browser signal as a request can send.
+func (c *GeminiClient) requestSessionHeaderValue() string {
+	return fmt.Sprintf(`["%s",1]`, c.requestUUID)
 }
 
 func (c *GeminiClient) loadCachedSession() bool {
@@ -466,7 +583,7 @@ func (c *GeminiClient) executeStreamRequest(prompt string, onChunk func(text str
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
 	msgInner := []interface{}{prompt, 0, nil, nil, nil, nil, 0}
-	msgLang := []string{"en-GB"}
+	msgLang := []string{geminiLanguage}
 	msgContext := []interface{}{c.ConversationID, c.ResponseID, c.ChoiceID, nil, nil, nil, nil, nil, nil, ""}
 	msgStruct := []interface{}{msgInner, msgLang, msgContext}
 
@@ -481,6 +598,7 @@ func (c *GeminiClient) executeStreamRequest(prompt string, onChunk func(text str
 	urlStr := "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
 	query := url.Values{}
 	query.Add("bl", c.BL)
+	query.Add("hl", geminiLanguage)
 	query.Add("_reqid", reqID)
 	query.Add("rt", "c")
 	if c.FSID != "" {
@@ -539,9 +657,11 @@ func (c *GeminiClient) doStreamRequestQUIC(fullURL string, data url.Values, onCh
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", "https://gemini.google.com/")
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525001261-jspb", c.flashHeaderValue())
+	req.Header.Set("x-goog-ext-525005358-jspb", c.requestSessionHeaderValue())
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0,0,0]`)
+	setBrowserHeaders(req.Header)
 	if c.RawCookies != "" {
 		req.Header.Set("Cookie", c.RawCookies)
 	}
@@ -573,9 +693,11 @@ func (c *GeminiClient) doStreamRequestHTTP2(fullURL string, data url.Values, onC
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", "https://gemini.google.com/")
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525001261-jspb", c.flashHeaderValue())
+	req.Header.Set("x-goog-ext-525005358-jspb", c.requestSessionHeaderValue())
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0,0,0]`)
+	setBrowserHeaders(req.Header)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
@@ -1074,7 +1196,7 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	reqID := fmt.Sprintf("%d", c.ReqID)
 
 	msgInner := []interface{}{prompt, 0, nil, imageRef, nil, nil, 0}
-	msgLang := []string{"en-GB"}
+	msgLang := []string{geminiLanguage}
 	msgContext := []interface{}{c.ConversationID, c.ResponseID, c.ChoiceID, nil, nil, nil, nil, nil, nil, ""}
 	msgStruct := []interface{}{msgInner, msgLang, msgContext}
 
@@ -1096,6 +1218,7 @@ func (c *GeminiClient) sendRequest(prompt string, tool string, imageRef []interf
 	urlStr := "https://gemini.google.com/_/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"
 	query := url.Values{}
 	query.Add("bl", c.BL)
+	query.Add("hl", geminiLanguage)
 	query.Add("_reqid", reqID)
 	query.Add("rt", "c")
 	if c.FSID != "" {
@@ -1172,9 +1295,11 @@ func (c *GeminiClient) sendRequestQUIC(fullURL string, data url.Values) (string,
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", "https://gemini.google.com/")
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525001261-jspb", c.flashHeaderValue())
+	req.Header.Set("x-goog-ext-525005358-jspb", c.requestSessionHeaderValue())
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0,0,0]`)
+	setBrowserHeaders(req.Header)
 	if c.RawCookies != "" {
 		req.Header.Set("Cookie", c.RawCookies)
 	}
@@ -1210,9 +1335,11 @@ func (c *GeminiClient) sendRequestHTTP2(fullURL string, data url.Values) (string
 	req.Header.Set("Origin", "https://gemini.google.com")
 	req.Header.Set("Referer", "https://gemini.google.com/")
 	req.Header.Set("X-Same-Domain", "1")
-	req.Header.Set("x-goog-ext-525001261-jspb", flashHeaderValue)
-	req.Header.Set("x-goog-ext-525005358-jspb", `["DIRECT-API-SESSION",1]`)
+	req.Header.Set("x-goog-ext-525001261-jspb", c.flashHeaderValue())
+	req.Header.Set("x-goog-ext-525005358-jspb", c.requestSessionHeaderValue())
 	req.Header.Set("x-goog-ext-73010989-jspb", `[0]`)
+	req.Header.Set("x-goog-ext-73010990-jspb", `[0,0,0]`)
+	setBrowserHeaders(req.Header)
 
 	resp, err := c.client.Do(req)
 	if err != nil {
